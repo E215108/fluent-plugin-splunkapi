@@ -33,17 +33,9 @@ class SplunkAPIOutput < BufferedOutput
   config_param :verify, :bool, :default => true
   config_param :auth, :string, :default => nil # TODO: required with rest
 
-  # for Splunk Storm API
-  config_param :access_token, :string, :default => nil # TODO: required with storm
-  config_param :api_hostname, :string, :default => 'api.splunkstorm.com'
-  config_param :project_id, :string, :default => nil # TODO: required with storm
-
   # Event parameters
-  config_param :host, :string, :default => nil # TODO: auto-detect
-  config_param :index, :string, :default => nil
   config_param :check_index, :bool, :default => true
-  config_param :source, :string, :default => '{TAG}'
-  config_param :sourcetype, :string, :default => 'fluent'
+  config_param :host, :string, :default => 'index'
 
   # Formatting
   config_param :time_format, :string, :default => 'localtime'
@@ -56,19 +48,13 @@ class SplunkAPIOutput < BufferedOutput
     super
     require 'net/http/persistent'
     require 'time'
+    require 'json'
     @idx_indexers = 0
     @indexers = []
   end
 
   def configure(conf)
     super
-
-    case @source
-    when '{TAG}'
-      @source_formatter = lambda { |tag| tag }
-    else
-      @source_formatter = lambda { |tag| @source.sub('{TAG}', tag) }
-    end
 
     case @time_format
     when 'none'
@@ -120,7 +106,7 @@ class SplunkAPIOutput < BufferedOutput
     @http = Net::HTTP::Persistent.new 'fluentd-plugin-splunkapi'
     @http.verify_mode = OpenSSL::SSL::VERIFY_NONE unless @verify
     @http.headers['Content-Type'] = 'text/plain'
-    $log.debug "initialized for splunkapi"
+    log.info "initialized for splunkapi"
   end
 
   def shutdown
@@ -128,47 +114,42 @@ class SplunkAPIOutput < BufferedOutput
     super
 
     @http.shutdown
-    $log.debug "shutdown from splunkapi"
+    log.debug "shutdown from splunkapi"
   end
 
   def format(tag, time, record)
-    if @time_formatter
-      time_str = "#{@time_formatter.call(time)}: "
-    else
-      time_str = ''
-    end
-
-    record.delete('time')
-    event = "#{time_str}#{@formatter.call(record)}\n"
-
+    record['metadata']['time'] = time
+    event = "#{@formatter.call(record)}\n"
     [tag, event].to_msgpack
   end
 
   def chunk_to_buffers(chunk)
     buffers = {}
-    chunk.msgpack_each do |tag, event|
-      (buffers[@source_formatter.call(tag)] ||= []) << event
+    chunk.msgpack_each do |tag, message|
+      event = JSON.parse(message)
+      uri = get_baseurl(tag, event['metadata'])
+      (buffers[uri] ||= []) << event['payload']
     end
     return buffers
   end
 
   def write(chunk)
-    chunk_to_buffers(chunk).each do |source, messages|
-      uri = URI get_baseurl + "&source=#{source}"
+    chunk_to_buffers(chunk).each do |url, messages|
+      uri = URI url
       post = Net::HTTP::Post.new uri.request_uri
       post.basic_auth @username, @password
       post.body = messages.join('')
-      $log.debug "POST #{uri}"
+      log.debug "POST #{uri}"
       # retry up to :post_retry_max times
       1.upto(@post_retry_max) do |c|
         response = @http.request uri, post
-        $log.debug "=> #{response.code} (#{response.message})"
+        log.debug "=> #{response.code} (#{response.message})"
         if response.code == "200"
           # success
           break
         elsif response.code.match(/^40/)
           # user error
-          $log.error "#{uri}: #{response.code} (#{response.message})\n#{response.body}"
+          log.error "#{uri}: #{response.code} (#{response.message})\n#{response.body}"
           break
         elsif c < @post_retry_max
           # retry
@@ -183,23 +164,19 @@ class SplunkAPIOutput < BufferedOutput
     end
   end
 
-  def get_baseurl
+  def get_baseurl(key, metadata)
     base_url = ''
-    if @protocol == 'rest'
-      @username, @password = @auth.split(':')
-      server = @indexers[@idx_indexers];
-      @idx_indexers = (@idx_indexers + 1) % @indexers.length
-      base_url = "https://#{server}/services/receivers/simple?sourcetype=#{@sourcetype}"
-      base_url += "&host=#{@host}" if @host
-      base_url += "&index=#{@index}" if @index
-      base_url += "&check-index=false" unless @check_index
-    elsif @protocol == 'storm'
-      @username, @password = 'x', @access_token
-      base_url = "https://#{@api_hostname}/1/inputs/http?index=#{@project_id}&sourcetype=#{@sourcetype}"
-      base_url += "&host=#{@host}" if @host
-    end
+    @username, @password = @auth.split(':')
+    server = @indexers[@idx_indexers];
+    @idx_indexers = (@idx_indexers + 1) % @indexers.length
+    base_url = "https://#{server}/services/receivers/simple?sourcetype=#{key}"
+    base_url += "&host=#{metadata['host']}" if metadata
+    base_url += "&index=#{@index}"
+    base_url += "&source=#{metadata['source']}" if metadata
+    base_url += "&check-index=false" unless @check_index
     base_url
   end
 end
 
+# Module close
 end
