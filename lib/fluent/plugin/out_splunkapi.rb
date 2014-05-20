@@ -35,19 +35,15 @@ class SplunkAPIOutput < BufferedOutput
 
   # Event parameters
   config_param :check_index, :bool, :default => true
-  config_param :host, :string, :default => 'index'
+  config_param :index, :string, :default => 'index'
 
-  # Formatting
-  config_param :time_format, :string, :default => 'localtime'
-  config_param :format, :string, :default => 'json'
-
+  # Retry parameters
   config_param :post_retry_max, :integer, :default => 5
   config_param :post_retry_interval, :integer, :default => 5
 
   def initialize
     super
     require 'net/http/persistent'
-    require 'time'
     require 'json'
     @idx_indexers = 0
     @indexers = []
@@ -56,49 +52,11 @@ class SplunkAPIOutput < BufferedOutput
   def configure(conf)
     super
 
-    case @time_format
-    when 'none'
-      @time_formatter = nil
-    when 'unixtime'
-      @time_formatter = lambda { |time| time.to_s }
-    when 'localtime'
-      @time_formatter = lambda { |time| Time.at(time).localtime }
-    else
-      @timef = TimeFormatter.new(@time_format, @localtime)
-      @time_formatter = lambda { |time| @timef.format(time) }
-    end
-
-    case @format
-    when 'json'
-      @formatter = lambda { |record|
-        record.to_json
-      }
-    when 'kvp'
-      @formatter = lambda { |record|
-        record_to_kvp(record)
-      }
-    when 'text'
-      @formatter = lambda { |record|
-        # NOTE: never modify 'record' directly
-        record_copy = record.dup
-        record_copy.delete('message')
-        if record_copy.length == 0
-          record['message']
-        else
-          "[#{record_to_kvp(record_copy)}] #{record['message']}"
-        end
-      }
-    end
-
     if @server.match(/,/)
       @indexers = @server.split(',')
     else
       @indexers = [@server]
     end
-  end
-
-  def record_to_kvp(record)
-    record.map {|k,v| v == nil ? "#{k}=" : "#{k}=\"#{v}\""}.join(' ')
   end
 
   def start
@@ -118,8 +76,7 @@ class SplunkAPIOutput < BufferedOutput
   end
 
   def format(tag, time, record)
-    record['metadata']['time'] = time
-    event = "#{@formatter.call(record)}\n"
+    event = "#{record.to_json}\n"
     [tag, event].to_msgpack
   end
 
@@ -127,7 +84,7 @@ class SplunkAPIOutput < BufferedOutput
     buffers = {}
     chunk.msgpack_each do |tag, message|
       event = JSON.parse(message)
-      uri = get_baseurl(tag, event['metadata'])
+      uri = get_baseurl(tag, event)
       (buffers[uri] ||= []) << event['payload']
     end
     return buffers
@@ -164,15 +121,15 @@ class SplunkAPIOutput < BufferedOutput
     end
   end
 
-  def get_baseurl(key, metadata)
+  def get_baseurl(key, event)
     base_url = ''
     @username, @password = @auth.split(':')
     server = @indexers[@idx_indexers];
     @idx_indexers = (@idx_indexers + 1) % @indexers.length
     base_url = "https://#{server}/services/receivers/simple?sourcetype=#{key}"
-    base_url += "&host=#{metadata['host']}" if metadata
+    base_url += "&host=#{event['host']}"
     base_url += "&index=#{@index}"
-    base_url += "&source=#{metadata['source']}" if metadata
+    base_url += "&source=#{event['source']}"
     base_url += "&check-index=false" unless @check_index
     base_url
   end
