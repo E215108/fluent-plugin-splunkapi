@@ -24,7 +24,7 @@
 module Fluent
 
 class SplunkAPIOutput < BufferedOutput
-  Plugin.register_output('splunkapi', self)
+  Plugin.register_output('splunkapi-ssln', self)
 
   config_param :protocol, :string, :default => 'rest'
 
